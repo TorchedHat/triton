@@ -1,5 +1,7 @@
 # End-to-end tests to check the correctness of the pipeliner
 
+import re
+
 import pytest
 import torch
 import triton
@@ -109,6 +111,16 @@ def vecadd_kernel(a_ptr, b_ptr, output_ptr, n_elements, num_blocks, BLOCK_SIZE: 
         output = x + y
         tl.store(output_ptr + offsets, output, mask=mask)
         offsets += BLOCK_SIZE
+
+
+@triton.jit
+def pipeline_div_kernel(input_ptr, output_ptr, n, BLOCK_SIZE: tl.constexpr, NUM_STAGES: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    accumulator = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
+    for i in tl.range(0, n, num_stages=NUM_STAGES):
+        load_offset = (i * BLOCK_SIZE) // (n - i)
+        accumulator += tl.load(input_ptr + load_offset + offsets)
+    tl.store(output_ptr + offsets, accumulator)
 
 
 @triton.jit
@@ -616,3 +628,26 @@ def test_conditional_store_pipeline(num_stages, device):
     # Expected output: [1, 2, 3, 4, ..., N]
     expected = torch.arange(1, N + 1, dtype=torch.int32, device=device)
     assert torch.equal(output, expected)
+
+
+def test_pipeline_predicates_non_speculatable_arithmetic(device):
+    if not is_cuda():
+        pytest.skip("test requires the NVIDIA load pipeliner")
+
+    n = 8
+    BLOCK_SIZE = 32
+    NUM_STAGES = 3
+    input = torch.arange(n * BLOCK_SIZE, dtype=torch.float32, device=device)
+    output = torch.empty(BLOCK_SIZE, device=device)
+    compiled = pipeline_div_kernel[(1, )](input, output, n, BLOCK_SIZE, NUM_STAGES)
+
+    expected = sum(input[i * BLOCK_SIZE // (n - i):i * BLOCK_SIZE // (n - i) + BLOCK_SIZE] for i in range(n))
+    torch.testing.assert_close(output, expected)
+
+    # The division is valid for every source iteration, but not for the future
+    # iterations computed by the pipeliner unless it is guarded by the pipeline predicate.
+    ttgir = compiled.asm["ttgir"]
+    divisions = re.findall(r"\barith\.divsi\b", ttgir)
+    guarded_divisions = re.findall(r"scf\.if\b[^{]*\{\s*%\w+ = arith\.divsi\b", ttgir)
+    assert len(divisions) > 1, ttgir
+    assert len(guarded_divisions) == len(divisions), ttgir
