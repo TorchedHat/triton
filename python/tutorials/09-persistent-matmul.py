@@ -196,7 +196,7 @@ def matmul_tma_set_block_size_hook(nargs):
     nargs["a_desc"].block_shape = [BLOCK_M, BLOCK_K]
     nargs["b_desc"].block_shape = [BLOCK_N, BLOCK_K]
     if EPILOGUE_SUBTILE:
-        nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
+        nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // nargs.get("EPILOGUE_SUBTILES", 2)]
     else:
         nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N]
 
@@ -375,7 +375,7 @@ def matmul_persistent(a, b):
 
 
 def matmul_tma_persistent_get_configs(pre_hook=None, num_ctas=1):
-    return [
+    configs = [
         triton.Config(
             {
                 'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K": BK, "GROUP_SIZE_M": 8, "EPILOGUE_SUBTILE":
@@ -388,6 +388,37 @@ def matmul_tma_persistent_get_configs(pre_hook=None, num_ctas=1):
         for w in [4, 8]  #
         for SUBTILE in [True, False]  #
     ]
+    if num_ctas == 2:
+        # Add candidates for medium K while retaining the original choices
+        # for short and long reductions.
+        for stages, subtiles in [(4, 4), (5, 2)]:
+            configs.append(
+                triton.Config(
+                    {
+                        "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 8,
+                        "EPILOGUE_SUBTILE": True, "EPILOGUE_SUBTILES": subtiles
+                    }, num_stages=stages, num_warps=4, num_ctas=2, pre_hook=pre_hook))
+    return configs
+
+
+@triton.jit
+def _split_tma_epilogue_tile(acc):
+    rows: tl.constexpr = acc.shape[0]
+    cols: tl.constexpr = acc.shape[1]
+    return tl.split(tl.reshape(acc, (rows, 2, cols // 2)).permute(0, 2, 1))
+
+
+@triton.jit
+def _store_tma_epilogue(c_desc, off_m, off_n, acc, dtype: tl.constexpr, SUBTILES: tl.constexpr):
+    tl.static_assert(SUBTILES == 2 or SUBTILES == 4)
+    a, b = _split_tma_epilogue_tile(acc)
+    tiles = (a, b)
+    if SUBTILES >= 4:
+        aa, ab = _split_tma_epilogue_tile(a)
+        ba, bb = _split_tma_epilogue_tile(b)
+        tiles = (aa, ab, ba, bb)
+    for i in tl.static_range(SUBTILES):
+        c_desc.store([off_m, off_n + i * (acc.shape[1] // SUBTILES)], tiles[i].to(dtype))
 
 
 @triton.autotune(
@@ -405,6 +436,7 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc,  #
                                  EPILOGUE_SUBTILE: tl.constexpr,  #
                                  NUM_SMS: tl.constexpr,  #
                                  WARP_SPECIALIZE: tl.constexpr,  #
+                                 EPILOGUE_SUBTILES: tl.constexpr = 2,  #
                                  ):
     dtype = tl.float8e4nv if FP8_OUTPUT else tl.float16
     start_pid = tl.program_id(axis=0)
@@ -439,15 +471,18 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc,  #
         # Epilogue subtiling is a technique to break our computation and stores into multiple pieces
         # By subtiling we can reduce shared memory consumption by the epilogue and instead use that
         # memory to increase our stage count.
-        # In this case we partition the accumulator into 2 BLOCK_SIZE_M x BLOCK_SIZE_N // 2 tensors
+        # The two-CTA configurations can also split into four pieces.
         if EPILOGUE_SUBTILE:
-            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-            acc = tl.permute(acc, (0, 2, 1))
-            acc0, acc1 = tl.split(acc)
-            c0 = acc0.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c], c0)
-            c1 = acc1.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+            if EPILOGUE_SUBTILES == 4:
+                _store_tma_epilogue(c_desc, offs_am_c, offs_bn_c, accumulator, dtype, EPILOGUE_SUBTILES)
+            else:
+                acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+                acc = tl.permute(acc, (0, 2, 1))
+                acc0, acc1 = tl.split(acc)
+                c0 = acc0.to(dtype)
+                c_desc.store([offs_am_c, offs_bn_c], c0)
+                c1 = acc1.to(dtype)
+                c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
         else:
             accumulator = accumulator.to(dtype)
             c_desc.store([offs_am_c, offs_bn_c], accumulator)

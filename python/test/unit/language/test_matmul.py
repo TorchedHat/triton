@@ -366,6 +366,43 @@ def test_tma_matmul_two_ctas_specialization(num_ctas, warp_specialize, persisten
     assert all(".multicast" not in line for line in ptx.splitlines() if "cp.async.bulk.tensor" in line)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.parametrize("subtiles, num_stages", [(4, 4), (2, 5)])
+@pytest.mark.parametrize("warp_specialize", [False, True])
+@pytest.mark.parametrize("K", [64, 512])
+@pytest.mark.parametrize("use_fp8", [False, True])
+def test_tma_matmul_two_ctas_tutorial_tuning(subtiles, num_stages, warp_specialize, K, use_fp8, device):
+    import importlib.util
+    from pathlib import Path
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    path = Path(__file__).resolve().parents[3] / "tutorials" / "09-persistent-matmul.py"
+    spec = importlib.util.spec_from_file_location("persistent_matmul_tutorial", path)
+    tutorial = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tutorial)
+    triton.set_allocator(lambda size, alignment, stream: torch.empty(size, device=device, dtype=torch.int8))
+    torch.manual_seed(0)
+    M, N = 2048, 1024
+    dtype = torch.float8_e4m3fn if use_fp8 else torch.float16
+    a = (torch.randn((M, K), device=device, dtype=torch.float16) * 0.1).to(dtype)
+    b = (torch.randn((N, K), device=device, dtype=torch.float16) * 0.1).to(dtype)
+    c = torch.empty((M, N), device=device, dtype=dtype)
+    descs = [
+        TensorDescriptor.from_tensor(t, shape)
+        for t, shape in [(a, [256, 64]), (b, [256, 64]), (c, [256, 256 // subtiles])]
+    ]
+    compiled = tutorial.matmul_kernel_tma_persistent.fn[(4, )](*descs, M, N, K, 256, 256, 64, 8, use_fp8, True, 4,
+                                                               warp_specialize, subtiles, num_ctas=2,
+                                                               num_stages=num_stages, num_warps=4)
+    if is_compile_warmup():
+        return
+    torch.testing.assert_close(c.float(), (a.float() @ b.float().T).to(dtype).float(), atol=0.03, rtol=0.03)
+    assert ("ttg.warp_specialize" in compiled.asm["ttgir"]) == warp_specialize
+    assert "tcgen05.mma.cta_group::2" in compiled.asm["ptx"]
+    assert "multicast" not in compiled.asm["ttgir"]
+    assert all(".multicast" not in line for line in compiled.asm["ptx"].splitlines() if "cp.async.bulk.tensor" in line)
+
+
 def test_i4_m_minor_join_bk16_matmul(device):
     if not is_cuda():
         pytest.skip("i4 M-minor join regression is CUDA-specific")
