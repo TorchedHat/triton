@@ -43,9 +43,10 @@ struct ScanOpConversion
     permuteRegisters(values, registerOrder);
 
     unsigned localSize = helper.getLocalScanSize();
+    bool scanEndpoints = localSize > 2 && helper.getStages().size() > 1;
 
     // First scan contiguous groups of registers owned by each thread.
-    scanRegisterGroups(op, values, localSize, rewriter);
+    scanRegisterGroups(op, values, localSize, scanEndpoints, rewriter);
 
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     Value threadId = getThreadId(rewriter, loc);
@@ -55,7 +56,7 @@ struct ScanOpConversion
     Value warpId = b.udiv(threadId, b.i32_val(warpSize));
 
     // Merge the groups into contiguous warp-local prefixes.
-    scanWithinWarps(op, helper, values, laneId, rewriter);
+    scanWithinWarps(op, helper, values, laneId, scanEndpoints, rewriter);
 
     // Finally add the carries from preceding warp-local segments.
     if (helper.getScratchLayout())
@@ -93,26 +94,38 @@ private:
   // Each group contains the consecutive low axis bits owned by registers.
   // Higher register bits can still be interleaved with lane/warp bits.
   void scanRegisterGroups(triton::ScanOp op, ScanValues &values,
-                          unsigned localSize,
+                          unsigned localSize, bool scanEndpoints,
                           ConversionPatternRewriter &rewriter) const {
     auto loc = op.getLoc();
     bool reverse = op.getReverse();
     for (unsigned base = 0; base < values.size(); base += localSize) {
-      for (unsigned i = 1; i < localSize; ++i) {
+      // For the endpoint scan, retain prefixes of the suffix excluding the
+      // leading element. They can all combine with the scanned leading value
+      // independently afterwards, without another serial register scan.
+      for (unsigned i = scanEndpoints ? 2 : 1; i < localSize; ++i) {
         unsigned r = base + (reverse ? localSize - 1 - i : i);
         unsigned prev = reverse ? r + 1 : r - 1;
         values[r] = applyCombineOp(loc, rewriter, op.getCombineOp(),
                                    values[prev], values[r]);
       }
+      if (scanEndpoints) {
+        unsigned first = base + (reverse ? localSize - 1 : 0);
+        unsigned last = base + (reverse ? 0 : localSize - 1);
+        values[last] = applyCombineOp(loc, rewriter, op.getCombineOp(),
+                                      values[first], values[last]);
+      }
     }
   }
 
-  // Merge every register prefix using the layout-derived tree.
+  // Every tree stage reads the terminal register of a local group. Scanning
+  // only each group's leading element and total saves combines without adding
+  // shuffles. Reconstruct the interior prefixes after the tree is complete.
   void scanWithinWarps(triton::ScanOp op, const ScanLoweringHelper &helper,
-                       ScanValues &values, Value laneId,
+                       ScanValues &values, Value laneId, bool scanEndpoints,
                        ConversionPatternRewriter &rewriter) const {
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
+    unsigned localSize = helper.getLocalScanSize();
     bool reverse = op.getReverse();
     for (const auto &stage : helper.getStages()) {
       // In logical coordinates the lower-half endpoint is
@@ -135,6 +148,9 @@ private:
       auto previous = values;
       DenseMap<unsigned, SmallVector<Value>> endpoints;
       for (unsigned r = 0; r < values.size(); ++r) {
+        unsigned localIndex = r % localSize;
+        if (scanEndpoints && localIndex != 0 && localIndex != localSize - 1)
+          continue;
         if (stage.current[0] && bool(r & stage.current[0]) == reverse)
           continue;
         unsigned src = (r & ~clear[0]) | set[0];
@@ -151,6 +167,19 @@ private:
         }
         values[r] =
             combineWithPrefix(op, it->second, previous[r], rewriter, pred);
+      }
+    }
+
+    // Combine the scanned leading element with each saved local suffix
+    // prefix. Both endpoints already contain their complete warp-local scan.
+    if (!scanEndpoints)
+      return;
+    for (unsigned base = 0; base < values.size(); base += localSize) {
+      unsigned first = base + (reverse ? localSize - 1 : 0);
+      for (unsigned i = 1; i + 1 < localSize; ++i) {
+        unsigned r = base + (reverse ? localSize - 1 - i : i);
+        values[r] = applyCombineOp(loc, rewriter, op.getCombineOp(),
+                                   values[first], values[r]);
       }
     }
   }

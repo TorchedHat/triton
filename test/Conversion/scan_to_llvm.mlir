@@ -43,6 +43,13 @@ tt.func private @test_1d_grouped(%arg0: tensor<8xi32, #layout_adj>) -> tensor<8x
 }
 
 // CHECK-LABEL: @test_warp_register_groups
+// WARP-LABEL: @test_warp_register_groups
+// Two groups: six local additions, sixteen lane-stage additions, two
+// register-stage additions, and four interior prefixes. Scanning every
+// register at every stage would require 42 additions.
+// WARP-COUNT-28: add i32
+// WARP-NOT: add i32
+// WARP: ret
 tt.func private @test_warp_register_groups(%arg: tensor<128xi32, #layout_reg4>) -> tensor<128xi32, #layout_reg4> {
   // CHECK-COUNT-9: @llvm.nvvm.shfl.sync.idx.i32
   // CHECK-NOT: @llvm.nvvm.shfl
