@@ -488,9 +488,17 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc,  #
             c_desc.store([offs_am_c, offs_bn_c], accumulator)
 
 
+def matmul_tma_persistent_prune_configs(configs, named_args, **kwargs):
+    # The additional epilogue/stage candidates are tuned for warp specialization.
+    if named_args.get("WARP_SPECIALIZE", kwargs.get("WARP_SPECIALIZE", False)):
+        return configs
+    return [config for config in configs if "EPILOGUE_SUBTILES" not in config.kwargs]
+
+
 matmul_kernel_tma_persistent_2cta = triton.autotune(
     configs=matmul_tma_persistent_get_configs(pre_hook=matmul_tma_set_block_size_hook, num_ctas=2),
     key=["M", "N", "K", "WARP_SPECIALIZE"],
+    prune_configs_by={"early_config_prune": matmul_tma_persistent_prune_configs},
 )(matmul_kernel_tma_persistent.fn)
 
 
