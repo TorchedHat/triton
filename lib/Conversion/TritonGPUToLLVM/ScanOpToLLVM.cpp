@@ -54,8 +54,12 @@ struct ScanOpConversion
     Value laneId = b.urem(threadId, b.i32_val(warpSize));
     Value warpId = b.udiv(threadId, b.i32_val(warpSize));
 
-    // Merge all prefixes, exchanging endpoints when a stage crosses warps.
-    scanTree(op, helper, values, laneId, warpId, rewriter);
+    // Merge the groups into contiguous warp-local prefixes.
+    scanWithinWarps(op, helper, values, laneId, rewriter);
+
+    // Finally add the carries from preceding warp-local segments.
+    if (helper.getScratchLayout())
+      scanAcrossWarps(op, helper, values, laneId, warpId, rewriter);
 
     // Restore the input register order before packing the results.
     permuteRegisters(values, registerOrder.inverse());
@@ -103,33 +107,13 @@ private:
     }
   }
 
-  // Each tree stage publishes only its source-half endpoints when they
-  // belong to other warps. Reuse compact scratch after all readers finish.
-  void scanTree(triton::ScanOp op, const ScanLoweringHelper &helper,
-                ScanValues &values, Value laneId, Value warpId,
-                ConversionPatternRewriter &rewriter) const {
+  // Merge every register prefix using the layout-derived tree.
+  void scanWithinWarps(triton::ScanOp op, const ScanLoweringHelper &helper,
+                       ScanValues &values, Value laneId,
+                       ConversionPatternRewriter &rewriter) const {
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto kLane = StringAttr::get(rewriter.getContext(), "lane");
-    auto kWarp = StringAttr::get(rewriter.getContext(), "warp");
-    const auto &layout = helper.getLayout();
-    unsigned numOperands = op.getNumOperands();
     bool reverse = op.getReverse();
-    auto free = layout.getFreeVariableMasks();
-    Value representative =
-        b.icmp_eq(b.or_(b.and_(laneId, b.i32_val(free.lookup(kLane))),
-                        b.and_(warpId, b.i32_val(free.lookup(kWarp)))),
-                  b.i32_val(0));
-
-    SmallVector<Value> smemBases;
-    SmallVector<Type> smemTypes;
-    if (unsigned elems = helper.getScratchSizeInElems()) {
-      smemBases = getSmemBases(op, elems, rewriter, targetInfo);
-      for (unsigned i = 0; i < numOperands; ++i)
-        smemTypes.push_back(getElementType(op, i));
-    }
-
-    bool usedScratch = false;
     for (const auto &stage : helper.getStages()) {
       // In logical coordinates the lower-half endpoint is
       // (x & ~((1 << (k + 1)) - 1)) | ((1 << k) - 1).
@@ -140,37 +124,10 @@ private:
         clear[d] = stage.lower[d] | stage.current[d];
         set[d] = reverse ? stage.current[d] : stage.lower[d];
       }
-      if (stage.scratch) {
-        // All reads of the preceding stage must finish before scratch reuse.
-        if (usedScratch)
-          b.barrier(triton::gpu::AddrSpace::Local);
-        Value writer =
-            b.and_(representative,
-                   b.and_(b.icmp_eq(b.and_(laneId, b.i32_val(clear[1])),
-                                    b.i32_val(set[1])),
-                          b.icmp_eq(b.and_(warpId, b.i32_val(clear[2])),
-                                    b.i32_val(set[2]))));
-        for (unsigned r = 0; r < values.size(); ++r) {
-          if ((r & clear[0]) != set[0])
-            continue;
-          Value offset = getScratchOffset(loc, rewriter, *stage.scratch, r,
-                                          laneId, warpId);
-          for (unsigned i = 0; i < numOperands; ++i) {
-            Value ptr = b.gep(smemBases[i].getType(), smemTypes[i],
-                              smemBases[i], offset);
-            targetInfo.storeShared(rewriter, loc, ptr, values[r][i], writer);
-          }
-        }
-        b.barrier(triton::gpu::AddrSpace::Local);
-        usedScratch = true;
-      }
-
       Value pred;
-      if (stage.current[1] || stage.current[2]) {
-        unsigned dim = stage.current[1] ? 1 : 2;
-        Value id = dim == 1 ? laneId : warpId;
-        Value bit = b.and_(id, b.i32_val(stage.current[dim]));
-        pred = b.icmp_eq(bit, b.i32_val(reverse ? 0 : stage.current[dim]));
+      if (stage.current[1]) {
+        Value bit = b.and_(laneId, b.i32_val(stage.current[1]));
+        pred = b.icmp_eq(bit, b.i32_val(reverse ? 0 : stage.current[1]));
       }
       // Every stage reads the previous stage, including when its source
       // register is also one of its destinations. Cache exchanged endpoints
@@ -184,16 +141,7 @@ private:
         auto it = endpoints.find(src);
         if (it == endpoints.end()) {
           SmallVector<Value> endpoint = previous[src];
-          if (stage.scratch) {
-            Value offset = getScratchOffset(loc, rewriter, *stage.scratch, r,
-                                            laneId, warpId);
-            for (unsigned i = 0; i < numOperands; ++i) {
-              Value ptr = b.gep(smemBases[i].getType(), smemTypes[i],
-                                smemBases[i], offset);
-              endpoint[i] = targetInfo.loadShared(rewriter, loc, ptr,
-                                                  smemTypes[i], b.true_val());
-            }
-          } else if (clear[1]) {
+          if (clear[1]) {
             Value lane =
                 b.or_(b.and_(laneId, b.i32_val(~clear[1])), b.i32_val(set[1]));
             for (Value &value : endpoint)
@@ -205,6 +153,157 @@ private:
             combineWithPrefix(op, it->second, previous[r], rewriter, pred);
       }
     }
+  }
+
+  // Publish one total per contiguous warp-local segment, then scan those
+  // totals in logical order and prepend the exclusive carry to each prefix.
+  void scanAcrossWarps(triton::ScanOp op, const ScanLoweringHelper &helper,
+                       ScanValues &values, Value laneId, Value warpId,
+                       ConversionPatternRewriter &rewriter) const {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto *ctx = rewriter.getContext();
+    auto kReg = StringAttr::get(ctx, "register");
+    auto kLane = StringAttr::get(ctx, "lane");
+    auto kWarp = StringAttr::get(ctx, "warp");
+    auto kBlock = StringAttr::get(ctx, "block");
+    const auto &layout = helper.getLayout();
+    const auto &scratch = *helper.getScratchLayout();
+    auto axis = *std::next(layout.getOutDimNames().begin(), op.getAxis());
+    unsigned segmentSize = helper.getSegmentSize();
+    unsigned numSegments = layout.getOutDimSize(axis) / segmentSize;
+    unsigned numParallel = scratch.getTotalOutDimSize() / numSegments;
+    unsigned numOperands = op.getNumOperands();
+    bool reverse = op.getReverse();
+
+    auto regMask = getInputBasisMask(layout, kReg, {axis});
+    auto laneMask = getInputBasisMask(layout, kLane, {axis});
+    auto warpMask = getInputBasisMask(layout, kWarp, {axis});
+    // Register order puts all axis bits first, sorted by logical significance.
+    unsigned axisRegs = regMask + 1;
+    unsigned segmentRegs = 1;
+    for (const auto &basis : layout.getBases().lookup(kReg))
+      if (basis[op.getAxis()] && basis[op.getAxis()] < segmentSize)
+        segmentRegs *= 2;
+
+    auto smemBases = storeWarpTotals(op, helper, values, segmentRegs, laneId,
+                                     warpId, rewriter);
+    b.barrier(triton::gpu::AddrSpace::Local);
+
+    SmallVector<Type> smemTypes;
+    for (unsigned i = 0; i < numOperands; ++i)
+      smemTypes.push_back(getElementType(op, i));
+    auto threadLayout = layout.sublayout({kLane, kWarp}, {axis});
+    Value threadSegment = applyLinearLayout(loc, rewriter, threadLayout,
+                                            {{kLane, laneId}, {kWarp, warpId}})
+                              .front()
+                              .second;
+    threadSegment =
+        b.lshr(threadSegment, b.i32_val(llvm::Log2_32(segmentSize)));
+    unsigned threadMask =
+        getOutputBasisMask(layout, {kLane, kWarp}, axis) / segmentSize;
+    unsigned regSegmentMask =
+        getOutputBasisMask(layout, {kReg}, axis) / segmentSize;
+    DenseMap<unsigned, unsigned> segmentToReg;
+    for (unsigned r = 0; r < axisRegs; r += segmentRegs) {
+      unsigned segment = layout
+                             .apply({{kReg, r},
+                                     {kLane, 0},
+                                     {kWarp, 0},
+                                     {kBlock, 0}})[op.getAxis()]
+                             .second /
+                         segmentSize;
+      segmentToReg[segment] = r;
+    }
+    Value parallelLane = b.and_(laneId, b.i32_val(~laneMask));
+    Value parallelWarp = b.and_(warpId, b.i32_val(~warpMask));
+    Value notFirst =
+        b.icmp_ne(threadSegment, b.i32_val(reverse ? threadMask : 0));
+
+    // Every thread reads the ordered segment totals for its parallel scan.
+    // Select its exclusive carry while accumulating, then consume that carry
+    // as soon as the last possible segment for a register group is reached.
+    // This keeps only one carry live for ordinary blocked layouts, but also
+    // handles register/lane/warp axis bits interleaved in any order.
+    for (unsigned base = 0; base < values.size(); base += axisRegs) {
+      Value parallelOffset = getScratchOffset(loc, rewriter, scratch, base,
+                                              parallelLane, parallelWarp);
+      SmallVector<Value> acc;
+      DenseMap<unsigned, SmallVector<Value>> carries;
+      for (unsigned step = 1; step < numSegments; ++step) {
+        unsigned previous = reverse ? numSegments - step : step - 1;
+        unsigned current = reverse ? previous - 1 : step;
+        Value index = b.add(parallelOffset, b.i32_val(previous * numParallel));
+        SmallVector<Value> total;
+        for (unsigned i = 0; i < numOperands; ++i) {
+          Value ptr =
+              b.gep(smemBases[i].getType(), smemTypes[i], smemBases[i], index);
+          total.push_back(targetInfo.loadShared(rewriter, loc, ptr,
+                                                smemTypes[i], b.true_val()));
+        }
+        acc = applyCombineOp(loc, rewriter, op.getCombineOp(), acc, total);
+        unsigned regSegment = current & regSegmentMask;
+        unsigned reg = segmentToReg.lookup(regSegment);
+        auto &carry = carries[reg];
+        if (carry.empty()) {
+          carry = acc;
+        } else {
+          Value pred =
+              b.icmp_eq(threadSegment, b.i32_val(current & threadMask));
+          for (unsigned i = 0; i < numOperands; ++i)
+            carry[i] = b.select(pred, acc[i], carry[i]);
+        }
+        unsigned last = reverse ? regSegment : regSegment | threadMask;
+        if (current != last)
+          continue;
+        Value pred =
+            regSegment == (reverse ? regSegmentMask : 0) ? notFirst : Value{};
+        for (unsigned r = base + reg; r < base + reg + segmentRegs; ++r)
+          values[r] = combineWithPrefix(op, carry, values[r], rewriter, pred);
+        carries.erase(reg);
+      }
+      assert(carries.empty() && "all carries must be consumed");
+    }
+  }
+
+  // Only the terminal element of each segment writes its total. When the
+  // layout broadcasts lanes or warps, elect one representative writer.
+  SmallVector<Value>
+  storeWarpTotals(triton::ScanOp op, const ScanLoweringHelper &helper,
+                  const ScanValues &values, unsigned segmentRegs, Value laneId,
+                  Value warpId, ConversionPatternRewriter &rewriter) const {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto kLane = StringAttr::get(rewriter.getContext(), "lane");
+    auto kWarp = StringAttr::get(rewriter.getContext(), "warp");
+    const auto &layout = helper.getLayout();
+    unsigned segmentLaneMask = 0;
+    for (auto [i, basis] : llvm::enumerate(layout.getBases().lookup(kLane)))
+      if (basis[op.getAxis()] && basis[op.getAxis()] < helper.getSegmentSize())
+        segmentLaneMask |= 1u << i;
+
+    auto smemBases =
+        getSmemBases(op, helper.getScratchSizeInElems(), rewriter, targetInfo);
+    auto free = layout.getFreeVariableMasks();
+    Value representative =
+        b.icmp_eq(b.or_(b.and_(laneId, b.i32_val(free.lookup(kLane))),
+                        b.and_(warpId, b.i32_val(free.lookup(kWarp)))),
+                  b.i32_val(0));
+    bool reverse = op.getReverse();
+    Value writer = b.and_(representative,
+                          b.icmp_eq(b.and_(laneId, b.i32_val(segmentLaneMask)),
+                                    b.i32_val(reverse ? 0 : segmentLaneMask)));
+    unsigned lastReg = reverse ? 0 : segmentRegs - 1;
+    for (unsigned r = lastReg; r < values.size(); r += segmentRegs) {
+      Value index = getScratchOffset(loc, rewriter, *helper.getScratchLayout(),
+                                     r, laneId, warpId);
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        Value ptr = b.gep(smemBases[i].getType(), getElementType(op, i),
+                          smemBases[i], index);
+        targetInfo.storeShared(rewriter, loc, ptr, values[r][i], writer);
+      }
+    }
+    return smemBases;
   }
 
   Value getScratchOffset(Location loc, ConversionPatternRewriter &rewriter,

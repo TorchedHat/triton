@@ -649,9 +649,9 @@ tt.func @call_graph_2(%A : !tt.ptr<f16>, %cond : i1) {
 }
 
 // expected-remark @below {{scan_alloc}}
-// expected-remark @below {{size = 64}}
+// expected-remark @below {{size = 128}}
 tt.func @scan_alloc(%x : tensor<8x16xf32, #AL>) {
-  // expected-remark @below {{offset = 0, size = 64}}
+  // expected-remark @below {{offset = 0, size = 128}}
   %a = "tt.scan"(%x) <{axis = 0 : i32, reverse = false}>({
   ^bb0(%arg0: f32, %arg1: f32):
     %add = arith.addf %arg0, %arg1 : f32

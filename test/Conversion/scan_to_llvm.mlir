@@ -180,28 +180,16 @@ tt.func public @anchor_permuted_lanes(%ptr: !llvm.ptr, %arg: !llvm.struct<(i32, 
 }
 
 // CHECK-LABEL: @test_interleaved
-// Each shared stage completes its stores before reads, and its reads
-// before the next stage reuses scratch.
+// Publish all warp-local segment totals once. Later register/lane axis bits
+// must not introduce another shared-memory exchange.
+// CHECK-NOT: @llvm.nvvm.barrier
 // CHECK: st.shared
 // CHECK: @llvm.nvvm.barrier
-// CHECK: load i32, ptr addrspace(3)
-// CHECK: @llvm.nvvm.barrier
-// CHECK: st.shared
-// CHECK: @llvm.nvvm.barrier
-// CHECK: load i32, ptr addrspace(3)
-// CHECK: @llvm.nvvm.barrier
-// CHECK: st.shared
-// CHECK: @llvm.nvvm.barrier
-// CHECK: load i32, ptr addrspace(3)
-// CHECK: @llvm.nvvm.barrier
-// CHECK: st.shared
-// CHECK: @llvm.nvvm.barrier
-// CHECK: load i32, ptr addrspace(3)
-// CHECK: @llvm.nvvm.barrier
-// CHECK: st.shared
-// CHECK: @llvm.nvvm.barrier
+// CHECK-NOT: @llvm.nvvm.barrier
+// CHECK-NOT: st.shared
 // CHECK: load i32, ptr addrspace(3)
 // CHECK-NOT: @llvm.nvvm.barrier
+// CHECK-NOT: st.shared
 // CHECK: ret
 tt.func private @test_interleaved(%arg: tensor<128xi32, #interleaved>) -> tensor<128xi32, #interleaved> {
   %0 = "tt.scan"(%arg) <{axis = 0 : i32, reverse = false}> ({

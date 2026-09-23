@@ -412,7 +412,6 @@ ScanLoweringHelper::ScanLoweringHelper(triton::ScanOp op)
       layout(triton::gpu::toLinearLayout(op.getInputTypes().front())) {
   auto *ctx = op.getContext();
   auto kReg = StringAttr::get(ctx, "register");
-  auto kBlock = StringAttr::get(ctx, "block");
   auto kOffset = StringAttr::get(ctx, "offset");
   auto axis = *std::next(layout.getOutDimNames().begin(), op.getAxis());
   layout = layout.removeZeroBasesAlongDim(kReg);
@@ -434,10 +433,19 @@ ScanLoweringHelper::ScanLoweringHelper(triton::ScanOp op)
   if (!isSupported())
     return;
 
-  SmallVector<StringAttr> dims = {kReg, StringAttr::get(ctx, "lane"),
-                                  StringAttr::get(ctx, "warp")};
+  auto kLane = StringAttr::get(ctx, "lane");
+  auto kWarp = StringAttr::get(ctx, "warp");
+  segmentSize = layout.getOutDimSize(axis);
+  for (const auto &basis : layout.getBases().lookup(kWarp)) {
+    if (basis[op.getAxis()])
+      segmentSize = std::min(segmentSize, unsigned(basis[op.getAxis()]));
+  }
+
+  // Only scan the contiguous warp-local segments here. All remaining axis
+  // bits are handled together by one exchange of segment totals.
+  SmallVector<StringAttr> dims = {kReg, kLane, kWarp};
   std::array<unsigned, 3> lower = {};
-  for (unsigned bit = 0; bit < layout.getOutDimSizeLog2(axis); ++bit) {
+  for (unsigned bit = 0; (1u << bit) < segmentSize; ++bit) {
     std::array<unsigned, 3> current = {};
     for (auto [d, dim] : llvm::enumerate(dims)) {
       for (auto [i, basis] : llvm::enumerate(layout.getBases().lookup(dim))) {
@@ -445,30 +453,37 @@ ScanLoweringHelper::ScanLoweringHelper(triton::ScanOp op)
           current[d] = 1u << i;
       }
     }
-    Stage stage{lower, current, std::nullopt};
-    if (lower[2] || current[2]) {
-      // Compact the unprocessed, non-broadcast CTA-local bits into an offset.
-      // All consumers of a lower-half endpoint have the same offset. Block
-      // bits are omitted because each CTA has its own scratch allocation.
-      LinearLayout::BasesT bases;
-      unsigned offsetBits = 0;
-      for (auto [d, dim] : llvm::enumerate(dims)) {
-        auto &offsetBases = bases[dim];
-        for (auto [i, basis] : llvm::enumerate(layout.getBases().lookup(dim))) {
-          bool keep = !((lower[d] | current[d]) & (1u << i)) &&
-                      llvm::any_of(basis, [](int32_t x) { return x != 0; });
-          offsetBases.push_back({keep ? int32_t(1u << offsetBits++) : 0});
-        }
-      }
-      bases[kBlock] = std::vector<std::vector<int32_t>>(
-          layout.getInDimSizeLog2(kBlock), {0});
-      stage.scratch = LinearLayout(std::move(bases), {kOffset});
-    }
     if ((1u << bit) >= localScanSize)
-      stages.push_back(std::move(stage));
+      stages.push_back({lower, current});
     for (unsigned d = 0; d < dims.size(); ++d)
       lower[d] |= current[d];
   }
+
+  if (segmentSize == layout.getOutDimSize(axis))
+    return;
+
+  // Store [segment][parallel] with parallel lane bits most minor. Threads
+  // scanning the same column read the same summary (a shared-memory broadcast),
+  // while adjacent parallel lanes read adjacent words instead of striding over
+  // register-owned values and introducing bank conflicts.
+  LinearLayout::BasesT bases;
+  for (auto [dim, dimBases] : layout.getBases())
+    bases[dim] = std::vector<std::vector<int32_t>>(dimBases.size(), {0});
+  unsigned parallelBits = 0;
+  for (auto dim : {kLane, kWarp, kReg}) {
+    for (auto [i, basis] : llvm::enumerate(layout.getBases().lookup(dim))) {
+      if (!basis[op.getAxis()] &&
+          llvm::any_of(basis, [](int32_t x) { return x != 0; }))
+        bases[dim][i][0] = 1u << parallelBits++;
+    }
+  }
+  for (auto dim : dims) {
+    for (auto [i, basis] : llvm::enumerate(layout.getBases().lookup(dim))) {
+      if (basis[op.getAxis()] >= segmentSize)
+        bases[dim][i][0] = (basis[op.getAxis()] / segmentSize) << parallelBits;
+    }
+  }
+  scratchLayout = LinearLayout(std::move(bases), {kOffset});
 }
 
 bool ScanLoweringHelper::isSupported() {
@@ -478,12 +493,7 @@ bool ScanLoweringHelper::isSupported() {
 }
 
 unsigned ScanLoweringHelper::getScratchSizeInElems() const {
-  unsigned elems = 0;
-  for (const Stage &stage : stages) {
-    if (stage.scratch)
-      elems = std::max(elems, unsigned(stage.scratch->getTotalOutDimSize()));
-  }
-  return elems;
+  return scratchLayout ? scratchLayout->getTotalOutDimSize() : 0;
 }
 
 unsigned ScanLoweringHelper::getScratchSizeInBytes() {

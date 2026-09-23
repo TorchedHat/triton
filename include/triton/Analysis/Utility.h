@@ -120,7 +120,6 @@ public:
   struct Stage {
     std::array<unsigned, 3> lower;
     std::array<unsigned, 3> current;
-    std::optional<triton::LinearLayout> scratch;
   };
 
   explicit ScanLoweringHelper(triton::ScanOp op);
@@ -128,6 +127,11 @@ public:
   const triton::LinearLayout &getLayout() const { return layout; }
   const triton::ColumnAction &getRegisterOrder() const { return registerOrder; }
   unsigned getLocalScanSize() const { return localScanSize; }
+  // Length of a contiguous logical segment contained in one warp.
+  unsigned getSegmentSize() const { return segmentSize; }
+  const std::optional<triton::LinearLayout> &getScratchLayout() const {
+    return scratchLayout;
+  }
   ArrayRef<Stage> getStages() const { return stages; }
   unsigned getScratchSizeInElems() const;
   unsigned getScratchSizeInBytes();
@@ -137,7 +141,9 @@ private:
   triton::LinearLayout layout;
   triton::ColumnAction registerOrder;
   unsigned localScanSize = 1;
+  unsigned segmentSize = 1;
   SmallVector<Stage> stages;
+  std::optional<triton::LinearLayout> scratchLayout;
 };
 
 // Helper class for lowering `tt.gather` operations. This class shares lowering
