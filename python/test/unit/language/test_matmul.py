@@ -359,10 +359,68 @@ def test_tma_matmul_two_ctas_specialization(num_ctas, warp_specialize, persisten
     if conditional:
         torch.testing.assert_close(x, a[:, :-64].float() @ b[:, :-64].float().T, atol=0.01, rtol=0.01)
     ttgir, ptx = compiled.asm["ttgir"], compiled.asm["ptx"]
-    assert ("ttg.warp_specialize" in ttgir) == (warp_specialize and not conditional)
+    assert ("ttg.warp_specialize" in ttgir) == warp_specialize
     assert "two_ctas" in ttgir
     assert "tcgen05.mma.cta_group::2" in ptx
     assert "multicast" not in ttgir
+    assert all(".multicast" not in line for line in ptx.splitlines() if "cp.async.bulk.tensor" in line)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.parametrize("num_ctas", [1, 2, 4, 8])
+@pytest.mark.parametrize("warp_specialize", [False, True])
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("reads", ["unconditional", "conditional", "multiple"])
+def test_tma_matmul_intermediate_accumulator_reads(num_ctas, warp_specialize, persistent, reads, device):
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    @triton.jit
+    def kernel(A, B, C, X, Y, M, K, BM: tl.constexpr, PERSISTENT: tl.constexpr, WS: tl.constexpr, READS: tl.constexpr):
+        for tile in tl.range(tl.program_id(0), M // BM, tl.num_programs(0), flatten=True, warp_specialize=WS
+                             and PERSISTENT):
+            acc = tl.full((BM, 64), 0, tl.float32)
+            for k in tl.range(K // 64, warp_specialize=WS and not PERSISTENT):
+                a = A.load([tile * BM, k * 64])
+                b = B.load([0, k * 64]).T
+                acc = tl.dot(a, b, acc)
+                if READS == "unconditional":
+                    X.store([tile * BM, k * 64], acc)
+                else:
+                    if k % 2 == 0:
+                        X.store([tile * BM, k * 64], acc)
+                    if READS == "multiple":
+                        if k % 3 == 0:
+                            Y.store([tile * BM, k * 64], acc)
+            C.store([tile * BM, 0], acc)
+
+    BM, K = 128 * num_ctas, 512
+    M = 3 * BM
+    torch.manual_seed(17)
+    a = torch.randn((M, K), device=device, dtype=torch.float16) * 0.1
+    b = torch.randn((64, K), device=device, dtype=torch.float16) * 0.1
+    c = torch.empty((M, 64), device=device, dtype=torch.float32)
+    x = torch.full((M, K // 64 * 64), -1, device=device, dtype=torch.float32)
+    y = torch.full_like(x, -1)
+    args = [
+        TensorDescriptor.from_tensor(t, shape)
+        for t, shape in [(a, [BM, 64]), (b, [64, 64]), (c, [BM, 64]), (x, [BM, 64]), (y, [BM, 64])]
+    ]
+    compiled = kernel[(1 if persistent else M // BM, )](*args, M, K, BM, persistent, warp_specialize, reads,
+                                                        num_ctas=num_ctas, num_stages=3, num_warps=4)
+    if is_compile_warmup():
+        return
+    torch.testing.assert_close(c, a.float() @ b.float().T, atol=0.01, rtol=0.01)
+    for k in range(K // 64):
+        partial = a[:, :(k + 1) * 64].float() @ b[:, :(k + 1) * 64].float().T
+        untouched = torch.full_like(partial, -1)
+        torch.testing.assert_close(x[:, k * 64:(k + 1) * 64],
+                                   partial if reads == "unconditional" or k % 2 == 0 else untouched, atol=0.01,
+                                   rtol=0.01)
+        torch.testing.assert_close(y[:, k * 64:(k + 1) * 64],
+                                   partial if reads == "multiple" and k % 3 == 0 else untouched, atol=0.01, rtol=0.01)
+    ttgir, ptx = compiled.asm["ttgir"], compiled.asm["ptx"]
+    assert ("ttg.warp_specialize" in ttgir) == warp_specialize
+    assert ("tcgen05.mma.cta_group::2" in ptx) == (num_ctas > 1)
     assert all(".multicast" not in line for line in ptx.splitlines() if "cp.async.bulk.tensor" in line)
 
 

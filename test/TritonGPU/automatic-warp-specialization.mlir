@@ -521,12 +521,16 @@ module attributes {"ttng.two-ctas" = true, "ttg.num-ctas" = 4 : i32, "ttg.num-wa
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[1, 0], [2, 0]], twoCTAs = true>
 module attributes {"ttng.two-ctas" = true, "ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  // Multiple readers including a conditional read retain ordinary pipelining.
-  // CLEAN-LABEL: @two_cta_conditional_read_fallback
-  // CLEAN-NOT: ttg.warp_specialize
-  // BASE: ttng.tc_gen5_mma {{.*}}tt.self_latency = 1 : i32
+  // Multiple readers share an acquisition, including across a conditional.
+  // CLEAN-LABEL: @two_cta_multiple_reads
+  // CLEAN: ttg.warp_specialize
+  // CLEAN: ttng.tmem_load
+  // CLEAN: scf.if
+  // CLEAN: ttng.tmem_load
+  // CLEAN: scf.if
+  // CLEAN: ttng.tmem_load
   // CLEAN: tt.return
-  tt.func @two_cta_conditional_read_fallback(%a: !tt.tensordesc<512x64xf16, #sharedA>, %b: !tt.tensordesc<64x128xf16, #sharedB>, %n: i32) {
+  tt.func @two_cta_multiple_reads(%a: !tt.tensordesc<512x64xf16, #sharedA>, %b: !tt.tensordesc<64x128xf16, #sharedB>, %n: i32) {
     %true = arith.constant true
     %false = arith.constant false
     %c0 = arith.constant 0 : i32
@@ -549,7 +553,15 @@ module attributes {"ttng.two-ctas" = true, "ttg.num-ctas" = 4 : i32, "ttg.num-wa
       } else {
         scf.yield %extra_token : !ttg.async.token
       }
-      scf.yield %done : !ttg.async.token
+      %other = arith.cmpi ne, %odd, %c0 : i32
+      %done_other = scf.if %other -> !ttg.async.token {
+        %v, %load = ttng.tmem_load %acc[%done] : !ttg.memdesc<512x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<512x128xf32, #blockedC>
+        "use"(%v) : (tensor<512x128xf32, #blockedC>) -> ()
+        scf.yield %load : !ttg.async.token
+      } else {
+        scf.yield %done : !ttg.async.token
+      }
+      scf.yield %done_other : !ttg.async.token
     } {tt.warp_specialize, tt.num_stages = 3 : i32}
     tt.return
   }
